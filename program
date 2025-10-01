@@ -1,0 +1,284 @@
+clear all;
+close all;
+
+% Новые данные из лекций (n=2, m=2)
+n = 2;  % Размерность состояния
+m = 2;  % Количество режимов
+A_all = {[0, 1; 0, 1], [-1, 0; 0, -2]};  % Матрицы A_i
+b_all = {[0; 1], [0; 1]};  % Векторы b_i
+
+% Параметры
+eps = 1e-5;  % Малое число для строгих неравенств
+tau0 = 0.5;  % Заданное время задержки τ0
+tol = 1e-6;  % Толеранс для проверки
+R = -eye(n);  % Для уравнения Ляпунова H' Q + Q H = R = -I
+
+% Шаг 1: Метод квадратичной стабилизации (LMI)
+disp('Шаг 1: Метод квадратичной стабилизации (LMI)');
+
+Y = sdpvar(n, n, 'symmetric');  % Y = H^{-1} > 0
+z = sdpvar(1, n);  % z = -k Y
+
+Constraints = [Y >= eps * eye(n)];  % Y > 0 (строго)
+
+for i = 1:m
+    LMI_i = Y * A_all{i}' + A_all{i} * Y + z' * b_all{i}' + b_all{i} * z;
+    Constraints = [Constraints, LMI_i <= -eps * eye(n)];  % < 0 (строго)
+end
+
+opts = sdpsettings('solver', 'sdpt3', 'verbose', 1);
+
+diagnostics = optimize(Constraints, [], opts);
+
+k_lmi = [];
+stable_lmi = false;
+if diagnostics.problem == 0
+    disp('Решение LMI найдено!');
+    Y_val = value(Y);
+    z_val = value(z);
+    k_lmi = -z_val / Y_val;
+    disp('Найденный регулятор k (из LMI):');
+    disp(k_lmi);
+    stable_lmi = true;
+    for i = 1:m
+        closed_loop = A_all{i} - b_all{i} * k_lmi;
+        eigs = eig(closed_loop);
+        disp(['Собственные значения для режима ', num2str(i), ' (LMI):']);
+        disp(eigs);
+        if any(real(eigs) >= 0)
+            stable_lmi = false;
+            disp('Режим НЕ устойчив!');
+        else
+            disp('Режим устойчив!');
+        end
+    end
+else
+    disp('Проблема с решением LMI:');
+    disp(diagnostics.info);
+    disp('Переходим к генетическому алгоритму.');
+end
+
+% Шаг 2: Генетический алгоритм для поиска k, если LMI не сработал
+if ~stable_lmi
+    disp('Шаг 2: Запускаем ручной генетический алгоритм...');
+
+    pop_size = 100;
+    max_gen = 50;
+    mutation_rate = 0.1;
+    lb = -10 * ones(1, n);
+    ub = 10 * ones(1, n);
+
+    pop = lb + (ub - lb) .* rand(pop_size, n);
+
+    best_fitness = Inf;
+    best_k = zeros(1, n);
+    for gen = 1:max_gen
+        fitness_vals = zeros(pop_size, 1);
+        for pop_idx = 1:pop_size
+            fitness_vals(pop_idx) = ga_fitness(pop(pop_idx, :), A_all, b_all, m);
+        end
+        
+        [min_fitness, min_idx] = min(fitness_vals);
+        if min_fitness < best_fitness
+            best_fitness = min_fitness;
+            best_k = pop(min_idx, :);
+        end
+        disp(['Поколение ', num2str(gen), ': Лучший f1 = ', num2str(best_fitness)]);
+        
+        selected = zeros(pop_size, n);
+        for s = 1:pop_size
+            tournament = randsample(pop_size, 2);
+            [~, winner] = min(fitness_vals(tournament));
+            selected(s, :) = pop(tournament(winner), :);
+        end
+        
+        offspring = zeros(pop_size, n);
+        for o = 1:2:pop_size
+            parent1 = selected(o, :);
+            parent2 = selected(o+1, :);
+            crossover_point = randi([1, n-1]);
+            offspring(o, :) = [parent1(1:crossover_point), parent2(crossover_point+1:end)];
+            offspring(o+1, :) = [parent2(1:crossover_point), parent1(crossover_point+1:end)];
+        end
+        
+        for mu = 1:pop_size
+            if rand < mutation_rate
+                mutate_idx = randi(n);
+                offspring(mu, mutate_idx) = lb(mutate_idx) + (ub(mutate_idx) - lb(mutate_idx)) * rand;
+            end
+        end
+        
+        pop = offspring;
+    end
+
+    k_ga = best_k';
+    disp('Найденный регулятор k (из GA):');
+    disp(k_ga');
+    
+    stable_ga = true;
+    for i = 1:m
+        closed_loop = A_all{i} - b_all{i} * k_ga';
+        eigs = eig(closed_loop);
+        disp(['Собственные значения для режима ', num2str(i), ' (GA):']);
+        disp(eigs);
+        if any(real(eigs) >= 0)
+            disp('Режим НЕ устойчив!');
+            stable_ga = false;
+        else
+            disp('Режим устойчив!');
+        end
+    end
+    
+    if ~stable_ga
+        disp('GA не нашло устойчивое k. Завершение.');
+        return;
+    end
+    k_combinations = k_ga';
+else
+    k_combinations = k_lmi;
+end
+
+% Шаг 3: Оценка τres методами Ляпунова и диагонализации
+disp('Шаг 3: Оценка времени задержки методами Ляпунова и диагонализации');
+
+% Метод Ляпунова
+theta_1 = Inf;
+k_1 = [];
+for j = 1:size(k_combinations, 1)
+    k = k_combinations(j, :)';
+    is_valid = true;
+    rho = 0;
+    theta = Inf;
+    
+    for i = 1:m
+        H = A_all{i} - b_all{i}*k';
+        
+        eigs_H = eig(H);
+        if any(real(eigs_H) >= -eps)
+            is_valid = false;
+            break;
+        end
+        
+        try
+            Q = lyap(H', R);
+        catch
+            is_valid = false;
+            break;
+        end
+        
+        eigs_Q = eig(Q);
+        min_eig_Q = min(real(eigs_Q));
+        if min_eig_Q < 1e-6
+            is_valid = false;
+            break;
+        end
+        
+        M = max(real(eigs_Q));
+        m_val = min(real(eigs_Q));
+        if m_val > 0 && M > 0
+            rho_i = sqrt(M / m_val);
+            rho = max(rho, rho_i);
+            theta_i = 1 / (2 * M);
+            theta = min(theta, theta_i);
+        else
+            is_valid = false;
+            break;
+        end
+    end
+    
+    if is_valid && theta > eps
+        if rho > 1 + eps
+            tau_res_lyap = 2 * log(rho) / theta;
+        else
+            tau_res_lyap = 0;
+        end
+        if isreal(tau_res_lyap) && tau_res_lyap >= 0
+            disp(['k для Ляпунова: ', mat2str(k')]);
+            disp(['rho = ', num2str(rho), ', theta = ', num2str(theta), ', tau_res_lyap = ', num2str(tau_res_lyap)]);
+            if tau_res_lyap < theta_1
+                theta_1 = tau_res_lyap;
+                k_1 = k;
+            end
+        end
+    end
+end
+
+% Метод диагонализации
+theta_2 = Inf;
+k_2 = [];
+for j = 1:size(k_combinations, 1)
+    k = k_combinations(j, :)';
+    gamma = -Inf;
+    mu = -Inf;
+    is_valid = true;
+    
+    for i = 1:m
+        H = A_all{i} - b_all{i}*k';
+        
+        eigs_H = eig(H);
+        if any(real(eigs_H) >= -eps)
+            is_valid = false;
+            break;
+        end
+        
+        gamma_i = max(abs(real(eigs_H)));
+        gamma = max(gamma, gamma_i);
+        
+        try
+            [T, D] = eig(H);
+            if rcond(T) < 1e-5
+                is_valid = false;
+                break;
+            end
+            norm_T = norm(T, 2);
+            norm_inv_T = norm(inv(T), 2);
+            mu_i = norm_T * norm_inv_T;
+            mu = max(mu, mu_i);
+        catch
+            is_valid = false;
+            break;
+        end
+    end
+    
+    if is_valid && gamma > eps
+        if mu > 1 + eps
+            tau_res_diag = 2 * log(mu) / gamma;
+        else
+            tau_res_diag = Inf;  % Изменено на Inf для случая mu <= 1
+        end
+        if isreal(tau_res_diag) && tau_res_diag >= 0
+            disp(['k для диагонализации: ', mat2str(k')]);
+            disp(['gamma = ', num2str(gamma), ', mu = ', num2str(mu), ', tau_res_diag = ', num2str(tau_res_diag)]);
+            if tau_res_diag < theta_2
+                theta_2 = tau_res_diag;
+                k_2 = k;
+            end
+        end
+    end
+end
+
+% Шаг 4: Минимальное τres и сравнение с τ0
+tau_res_all = [theta_1, theta_2];
+tau_res = min(tau_res_all(tau_res_all >= 0 & isfinite(tau_res_all)));
+if ~isempty(tau_res)
+    disp(['Минимальное τres: ', num2str(tau_res)]);
+    if tau_res < tau0
+        disp('Стабилизация системы гарантирована!');
+    else
+        disp(['Стабилизация системы НЕ гарантирована. Рекомендуется увеличить τ0 (текущее τ0 = ', num2str(tau0), ') или скорректировать модель.']);
+    end
+else
+    disp('Не удалось найти подходящее τres.');
+end
+
+% Функция фитнеса для GA
+function f = ga_fitness(k, A_all, b_all, m)
+    k = k(:)';
+    f1 = -Inf;
+    for i = 1:m
+        closed_loop = A_all{i} - b_all{i} * k;
+        eigs = eig(closed_loop);
+        f1 = max(f1, max(real(eigs)));
+    end
+    f = f1;
+end
